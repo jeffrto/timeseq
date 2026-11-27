@@ -1,7 +1,7 @@
 {
 	"id": "timeseq",
 	"name": "Timeseq",
-	"version": "1.0.4",
+	"version": "1.1.0",
 	"minAppVersion": "0.15.0",
 	"description": "Timestamp every line you write under dated headings (to the second), including tasks.",
 	"author": "Eddie Blundell (fork by jeffrto)",

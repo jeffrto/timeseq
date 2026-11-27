@@ -7,73 +7,63 @@ import {
 	PluginSettingTab,
 	Setting,
 	moment,
-	debounce,
 } from 'obsidian';
+import { EditorState } from '@codemirror/state';
 import { getDailyNoteSettings } from 'obsidian-daily-notes-interface';
-
+import { isHeading } from './src/logic';
+import type { Ctx } from './src/logic';
+import { createFilter } from './src/filter';
 
 interface TimelogSettings {
-	replacementInterval: number;
-	useList: boolean;
 	logFormat: string;
-	debounceMs: number;
+	alwaysBullet: boolean;
+	stampCompletion: boolean;
 	autoAddDateHeading: boolean;
 }
 
 const DEFAULT_SETTINGS: TimelogSettings = {
-	replacementInterval: 30,
-	debounceMs: 500,
-	useList: false,
-	logFormat: 'HH:mm',
+	logFormat: 'HH:mm:ss',
+	alwaysBullet: true,
+	stampCompletion: true,
 	autoAddDateHeading: true,
 };
 
 const DEFAULT_HEADER_FORMAT = 'YYYY-MM-DD';
-const LIST_MARKER_REGEX = /^(\s*[-*+]\s+)/;
 
 export default class TimelogPlugin extends Plugin {
 	settings: TimelogSettings;
 
 	dailyNoteFormat: string = DEFAULT_HEADER_FORMAT;
-	lastReplacements: Map<string, Date> = new Map();
 	statusBarItemEl: HTMLElement;
 
 	async onload() {
 		await this.loadSettings();
 
-		// Watch for changes to intercept log lines
-		this.registerEvent(
-			this.app.workspace.on(
-				'editor-change',
-				debounce(
-					this.onEditorChange.bind(this),
-					this.settings.debounceMs,
-					false,
-				),
-			),
+		const dailySettings = getDailyNoteSettings();
+		this.dailyNoteFormat = dailySettings?.format || DEFAULT_HEADER_FORMAT;
+
+		this.registerEditorExtension(
+			EditorState.transactionFilter.of(createFilter(() => this.ctx())),
 		);
 
-		const dailySettings = getDailyNoteSettings();
-		this.dailyNoteFormat = dailySettings?.format ?? DEFAULT_HEADER_FORMAT;
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
 		this.statusBarItemEl = this.addStatusBarItem();
 		this.statusBarItemEl.hide();
 		this.updateStatusBar();
 
 		this.registerEvent(
-			this.app.workspace.on('active-leaf-change', () => {
-				this.updateStatusBar();
-			}),
+			this.app.workspace.on('active-leaf-change', () => this.updateStatusBar()),
+		);
+		this.registerEvent(
+			this.app.workspace.on('editor-change', (editor) => this.updateStatusBar(editor)),
 		);
 
-		// Start new logging day
 		this.addCommand({
 			id: 'start-log-entry',
 			name: 'Start log entry',
 			editorCallback: (editor: Editor) => {
 				const date = moment().format(this.dailyNoteFormat);
-				editor.replaceSelection(`## [[${date}]]\n\n`);
+				const bullet = this.settings.alwaysBullet ? '- ' : '';
+				editor.replaceSelection(`## [[${date}]]\n${bullet}**${this.now()}**: `);
 				this.updateStatusBar(editor);
 			},
 		});
@@ -107,92 +97,20 @@ export default class TimelogPlugin extends Plugin {
 		this.addSettingTab(new TimelogSettingTab(this.app, this));
 	}
 
-	onEditorChange(editor: Editor, view: MarkdownView) {
-		this.updateStatusBar(editor);
-		const filePath = view.file?.path;
-		if (!filePath || !this.shouldInsertLine(editor, filePath)) {
-			return;
-		}
-		this.insertLogLine(editor, filePath);
+	ctx(): Ctx {
+		return {
+			headerDate: (line) => this.extractHeaderDate(line)?.format(this.dailyNoteFormat) ?? null,
+			isStamp: (text) => moment(text, this.settings.logFormat, true).isValid(),
+			now: () => this.now(),
+			today: () => moment().format(this.dailyNoteFormat),
+			alwaysBullet: this.settings.alwaysBullet,
+			autoHeading: this.settings.autoAddDateHeading,
+			stampCompletion: this.settings.stampCompletion,
+		};
 	}
 
-	/** 
-	 * Inserts a log line into the editor at the current cursor position
-	*/
-	insertLogLine(editor: Editor, filePath: string): boolean {
-		// Check if date has rolled over and we need a new heading
-		if (this.settings.autoAddDateHeading) {
-			this.insertDateHeadingIfNeeded(editor);
-		}
-		
-		// Get cursor after potential heading insertion
-		const cursor = editor.getCursor();
-		const logPrefix = this.getFormattedLogPrefix();
-		const logHeader = `**${logPrefix}**: `;
-		const line = editor.getLine(cursor.line);
-		
-		// Find the position after any list marker (-, *, +) and its trailing space
-		const listMatch = line.match(LIST_MARKER_REGEX);
-		const offset = listMatch ? listMatch[1].length : 0;
-
-		editor.replaceRange(logHeader, { line: cursor.line, ch: offset });
-		editor.setCursor({
-			line: cursor.line,
-			ch: cursor.ch + logHeader.length,
-		});
-		this.lastReplacements.set(filePath, new Date());
-
-		return true;
-	}
-
-	/**
-	 * Checks if the date has changed since the previous heading and inserts a new one if needed
-	 */
-	insertDateHeadingIfNeeded(editor: Editor): void {
-		const cursor = editor.getCursor();
-		const today = moment().format(this.dailyNoteFormat);
-		
-		// Find the nearest dated header above the cursor
-		let currentLine = cursor.line;
-		let inCodeBlock = false;
-		
-		while (currentLine-- > 0) {
-			const line = editor.getLine(currentLine);
-			
-			if (this.isCodeFence(line)) {
-				inCodeBlock = !inCodeBlock;
-				continue;
-			}
-			
-			if (inCodeBlock) {
-				continue;
-			}
-			
-			const headerDate = this.extractHeaderDate(line);
-			if (headerDate) {
-				const headerDateStr = headerDate.format(this.dailyNoteFormat);
-				if (headerDateStr !== today) {
-					// Check if we need a blank line before the heading
-					const prevLine = cursor.line > 0 ? editor.getLine(cursor.line - 1) : '';
-					const needsBlankLine = cursor.line > 0 && prevLine.trim() !== '';
-					
-					// Date has rolled over, insert new heading
-					const newHeading = (needsBlankLine ? '\n' : '') + `## [[${today}]]\n\n`;
-					editor.replaceRange(newHeading, { line: cursor.line, ch: 0 });
-					const offset = needsBlankLine ? 3 : 2;
-					editor.setCursor({ line: cursor.line + offset, ch: 0 });
-				}
-				return;
-			}
-		}
-	}
-
-	getFormattedLogPrefix() {
-		try {
-			return moment().format(this.settings.logFormat);
-		} catch (e) {
-			return moment().format(DEFAULT_SETTINGS.logFormat);
-		}
+	now(): string {
+		return moment().format(this.settings.logFormat || DEFAULT_SETTINGS.logFormat);
 	}
 
 	findLatestDatedHeader(editor: Editor): number | null {
@@ -217,7 +135,7 @@ export default class TimelogPlugin extends Plugin {
 
 	extractHeaderDate(line: string): moment.Moment | null {
 		const trimmed = line.trim();
-		if (!trimmed.startsWith('#')) {
+		if (!isHeading(trimmed)) {
 			return null;
 		}
 
@@ -242,10 +160,7 @@ export default class TimelogPlugin extends Plugin {
 		}
 
 		this.statusBarItemEl.show();
-
-		this.statusBarItemEl.setText(
-			`Logging active ${this.settings.replacementInterval}s`,
-		);
+		this.statusBarItemEl.setText('Timeseq active');
 	}
 
 	getActiveEditor(): Editor | null {
@@ -263,114 +178,8 @@ export default class TimelogPlugin extends Plugin {
 		return false;
 	}
 
-	shouldInsertLine(editor: Editor, filePath: string) {
-
-		if (!this.isWithinInterval(filePath)) {
-			return false;
-		}
-
-		// Determine if any lines between and include the previous header
-		// contain the log keyword.
-		let currentLine = editor.getCursor().line;
-		let line = editor.getLine(currentLine);
-
-		// Don't double log.
-		if (this.isLoggedLine(line)) {
-			return false;
-		}
-
-		const hasList = LIST_MARKER_REGEX.test(line);
-		const isNested = line.startsWith('\t');
-
-		if (this.settings.useList) {
-			// Obsidian has completed italics/bold for us so wait.
-			if (line.indexOf('**') === 0) {
-				return false;
-			}
-			// TODO: add setting for nesting level.
-			// we would then log by minute & Second to avoid collisions.
-			if (isNested) {
-				return false;
-			}
-			if (!hasList) {
-				return false;
-			}
-		}
-
-		// Look for log headers above the current line
-		// Track code fence state - when walking upward, hitting a fence
-		// means we're entering a code block from below
-		let inCodeBlock = false;
-
-		while (currentLine-- > 0) {
-			line = editor.getLine(currentLine);
-
-			if (this.isCodeFence(line)) {
-				inCodeBlock = !inCodeBlock;
-				continue;
-			}
-
-			// Skip header detection inside code blocks
-			if (inCodeBlock) {
-				continue;
-			}
-
-			if (this.isLogHeader(line)) {
-				return true;
-			} else if (this.isNormalHeader(line)) {
-				return false;
-			}
-		}
-
-		return false;
-	}
-
-	// Determine if last replacement run in past X seconds
-	isWithinInterval(filePath: string) {
-		const interval = this.settings.replacementInterval;
-		const lastReplacement = this.lastReplacements.get(filePath);
-
-		if (
-			lastReplacement &&
-			new Date().getTime() - lastReplacement.getTime() <
-			interval * 1000
-		) {
-			return false;
-		}
-		return true;
-	}
-
-	isLogHeader(line: string) {
-		return this.extractHeaderDate(line) !== null;
-	}
-
-	isNormalHeader(line: string) {
-		return line.startsWith('#');
-	}
-
-	isCodeFence(line: string) {
-		const trimmed = line.trim();
-		return trimmed.startsWith('```') || trimmed.startsWith('~~~');
-	}
-
-	isLoggedLine(line: string) {
-		// Remove all optional spaces and hyphens from start of line
-		const l = line
-			.replace(/^[-\s]/g, '')
-			// Remove formatting
-			.replace(/\*/g, '')
-			// Now take the substr of the length of the time format
-			.substring(0, this.settings.logFormat.length);
-
-		return moment(l, this.settings.logFormat).isValid();
-	}
-
 	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			await this.loadData(),
-		);
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
 	async saveSettings() {
@@ -392,65 +201,46 @@ class TimelogSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Minimum log duration')
-			.setDesc(
-				'Minimum time in seconds between log entries being prefixed',
-			)
-			.addSlider((slider) =>
-				slider
-					.setValue(
-						this.plugin.settings.replacementInterval
-							? this.plugin.settings.replacementInterval
-							: 60,
-					)
-					.setLimits(1, 180, 1)
-					.onChange(async (value) => {
-						this.plugin.settings.replacementInterval = value;
-						await this.plugin.saveSettings();
-						this.plugin.updateStatusBar();
-					})
-					.setDynamicTooltip(),
-			);
-
-		new Setting(containerEl)
 			.setName('Log format')
-			.setDesc('Format of timestamp to prefix log entries e.g HH:MM')
+			.setDesc('Moment.js format of the timestamp, e.g. HH:mm:ss')
 			.addMomentFormat((format) =>
 				format
-					.setValue(
-						this.plugin.settings.logFormat ??
-						DEFAULT_SETTINGS.logFormat,
-					)
+					.setDefaultFormat(DEFAULT_SETTINGS.logFormat)
+					.setValue(this.plugin.settings.logFormat ?? DEFAULT_SETTINGS.logFormat)
 					.onChange(async (value) => {
-						this.plugin.settings.logFormat = value;
+						this.plugin.settings.logFormat = value || DEFAULT_SETTINGS.logFormat;
 						await this.plugin.saveSettings();
-						this.plugin.updateStatusBar();
 					}),
 			);
 
 		new Setting(containerEl)
-			.setName('Use lists only')
-			.setDesc('Use lists for log entries')
+			.setName('Always use bullets')
+			.setDesc('When pressing Enter on a line that is not a list item, start a bullet ("- ") before the timestamp')
 			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.useList)
-					.onChange(async (value) => {
-						this.plugin.settings.useList = value;
-						await this.plugin.saveSettings();
-						this.plugin.updateStatusBar();
-					}),
+				toggle.setValue(this.plugin.settings.alwaysBullet).onChange(async (value) => {
+					this.plugin.settings.alwaysBullet = value;
+					await this.plugin.saveSettings();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName('Completion time on tasks')
+			.setDesc('When a timestamped task is checked, append " ✅ <time>". Unchecking removes it.')
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.stampCompletion).onChange(async (value) => {
+					this.plugin.settings.stampCompletion = value;
+					await this.plugin.saveSettings();
+				}),
 			);
 
 		new Setting(containerEl)
 			.setName('Auto-add date heading')
 			.setDesc('Automatically add a new date heading when the date rolls over (e.g., after midnight)')
 			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.autoAddDateHeading)
-					.onChange(async (value) => {
-						this.plugin.settings.autoAddDateHeading = value;
-						await this.plugin.saveSettings();
-					}),
+				toggle.setValue(this.plugin.settings.autoAddDateHeading).onChange(async (value) => {
+					this.plugin.settings.autoAddDateHeading = value;
+					await this.plugin.saveSettings();
+				}),
 			);
 	}
 }

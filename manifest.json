@@ -1,11 +1,10 @@
 {
-	"id": "time-log",
-	"name": "Timelog",
+	"id": "timeseq",
+	"name": "Timeseq",
 	"version": "1.0.4",
 	"minAppVersion": "0.15.0",
-	"description": "Add timestamps to entries under dated headers for lab notebook style logging.",
-	"author": "Eddie Blundell",
+	"description": "Timestamp every line you write under dated headings (to the second), including tasks.",
+	"author": "Eddie Blundell (fork by jeffrto)",
 	"authorUrl": "https://hakobox.co.uk",
-	"fundingUrl": "https://github.com/sponsors/hakoboxsoftware",
 	"isDesktopOnly": false
 }
